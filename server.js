@@ -7,11 +7,13 @@ const authenticateUser = require('./middleware');
 require('dotenv').config();
 
 const app = express();
+
+// Render overrides this value dynamically to port 10000 or others
 const PORT = process.env.PORT || 5000;
 
-// FIX: Enable CORS fully so Vercel or local browsers can make requests to Render
+// Enable CORS cleanly for production deployment environments
 app.use(cors({
-    origin: '*', // Allows all domains to communicate during initial development phase
+    origin: '*', 
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
@@ -221,7 +223,7 @@ app.post('/api/campaigns/complete', authenticateUser, async (req, res) => {
     }
 });
 
-// Start Server
+// Start Server dynamically mapping the port configuration
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Server running dynamically on port ${PORT}`);
 });
