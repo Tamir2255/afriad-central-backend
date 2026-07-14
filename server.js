@@ -6,8 +6,6 @@ const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
-
-// Set production/development dynamic port
 const PORT = process.env.PORT || 5000;
 
 // Enable CORS cleanly for cross-platform request handling
@@ -24,6 +22,65 @@ const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
+
+// ==========================================
+// AUTOMATIC DATABASE MIGRATION ENGINE
+// ==========================================
+const runDatabaseMigrations = async () => {
+    const client = await pool.connect();
+    try {
+        console.log("Checking and preparing database tables...");
+
+        // 1. Ensure Wallets Table exists
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS wallets (
+                id SERIAL PRIMARY KEY,
+                advertiser_id INTEGER NOT NULL UNIQUE,
+                ugx_balance DECIMAL(15, 2) DEFAULT 0.00,
+                kes_balance DECIMAL(15, 2) DEFAULT 0.00,
+                tzs_balance DECIMAL(15, 2) DEFAULT 0.00,
+                rwf_balance DECIMAL(15, 2) DEFAULT 0.00,
+                zar_balance DECIMAL(15, 2) DEFAULT 0.00,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        // 2. Ensure Campaigns Table exists
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS campaigns (
+                id SERIAL PRIMARY KEY,
+                advertiser_id INTEGER NOT NULL,
+                campaign_type VARCHAR(50) NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                media_url TEXT NOT NULL,
+                target_country VARCHAR(100) NOT NULL,
+                currency VARCHAR(10) NOT NULL,
+                total_units INTEGER NOT NULL,
+                total_budget DECIMAL(15, 2) NOT NULL,
+                remaining_budget DECIMAL(15, 2) NOT NULL,
+                status VARCHAR(50) DEFAULT 'pending_admin_approval',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        // 3. Force Auto-repair: Inject missing columns if campaigns table was created in an older version
+        await client.query(`
+            ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS total_units INTEGER DEFAULT 1;
+        `);
+        await client.query(`
+            ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS remaining_budget DECIMAL(15, 2) DEFAULT 0.00;
+        `);
+
+        console.log("Database migrations completed successfully. Tables are fully up-to-date!");
+    } catch (err) {
+        console.error("CRITICAL: Database migration failed during startup:", err.message);
+    } finally {
+        client.release();
+    }
+};
+
+// Run migrations on startup
+runDatabaseMigrations();
 
 // Helper validation middleware
 const authenticateUser = (req, res, next) => {
@@ -161,7 +218,7 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ==========================================
-// 2. CONCURRENCY CONTROL CAMPAIGN ROUTE (FIXED)
+// 2. CONCURRENCY CONTROL CAMPAIGN ROUTE
 // ==========================================
 app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
     const { 
@@ -206,24 +263,6 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
     const client = await pool.connect();
 
     try {
-        // Dynamic structural auto-repair for the campaigns relation properties
-        await client.query(`
-            CREATE TABLE IF NOT EXISTS campaigns (
-                id SERIAL PRIMARY KEY,
-                advertiser_id INTEGER NOT NULL,
-                campaign_type VARCHAR(50) NOT NULL,
-                title VARCHAR(255) NOT NULL,
-                media_url TEXT NOT NULL,
-                target_country VARCHAR(100) NOT NULL,
-                currency VARCHAR(10) NOT NULL,
-                total_units INTEGER NOT NULL,
-                total_budget DECIMAL(15, 2) NOT NULL,
-                remaining_budget DECIMAL(15, 2) NOT NULL,
-                status VARCHAR(50) DEFAULT 'pending_admin_approval',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-
         await client.query('BEGIN');
 
         // Row-level isolation lock to prevent concurrent multi-spending anomalies
