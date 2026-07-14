@@ -37,7 +37,7 @@ const PRICING_MATRIX = {
 };
 
 // ==========================================
-// 1. ISOLATED DATABASE INITIALIZATION (HOT FIXES APPLIED)
+// 1. ISOLATED DATABASE INITIALIZATION (ALL HOT FIXES APPLIED)
 // ==========================================
 const initializeDatabaseSchema = async () => {
     const client = await pool.connect();
@@ -88,12 +88,19 @@ const initializeDatabaseSchema = async () => {
             );
         `);
 
-        // HOT FIX: Force add columns if table exists but is missing fields (resolves the exact pg error)
+        // HOT PATCHES: Explicitly inject every schema element if the table was pre-existing but modified
+        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS advertiser_id INTEGER;`);
         await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS campaign_type VARCHAR(50) DEFAULT 'classified';`);
+        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS title VARCHAR(255) DEFAULT '';`);
+        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS media_url TEXT DEFAULT '';`);
+        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS target_country VARCHAR(100) DEFAULT '';`);
+        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS currency VARCHAR(10) DEFAULT 'UGX';`);
         await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS total_units INTEGER DEFAULT 1;`);
+        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS total_budget DECIMAL(15, 2) DEFAULT 0.00;`);
         await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS remaining_budget DECIMAL(15, 2) DEFAULT 0.00;`);
+        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'pending_admin_approval';`);
 
-        console.log("Database schema synchronized successfully!");
+        console.log("Database schema synchronized and auto-healed successfully!");
     } catch (err) {
         console.error("Critical error during database layout initialization:", err.message);
     } finally {
@@ -122,7 +129,7 @@ const authenticateUser = (req, res, next) => {
     }
 };
 
-// Standard API Health Check displaying our Brand Joined Logo configuration data
+// Standard API Health Check
 app.get('/', (req, res) => {
     res.json({
         message: "AfriAd Multicurrency Backend API is running successfully!",
