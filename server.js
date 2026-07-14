@@ -59,7 +59,7 @@ const PRICING_MATRIX = {
 };
 
 // ==========================================
-// 1. UPDATED AUTHENTICATION ROUTES
+// 1. AUTHENTICATION ROUTES
 // ==========================================
 
 // Register User (With automatic Multi-Currency Wallet Initializer)
@@ -116,7 +116,6 @@ app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
 
     try {
-        // Find user first
         const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
         if (userResult.rows.length === 0) {
             return res.status(400).json({ error: "Invalid credentials." });
@@ -128,7 +127,6 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(400).json({ error: "Invalid credentials." });
         }
 
-        // Retrieve wallet state linked to user
         const walletResult = await pool.query('SELECT * FROM wallets WHERE advertiser_id = $1', [user.id]);
         let userWallet = { ugx_balance: 0, kes_balance: 0, tzs_balance: 0, rwf_balance: 0, zar_balance: 0 };
 
@@ -163,7 +161,7 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ==========================================
-// 2. CONCURRENCY CONTROL CAMPAIGN ROUTE
+// 2. CONCURRENCY CONTROL CAMPAIGN ROUTE (FIXED)
 // ==========================================
 app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
     const { 
@@ -183,31 +181,52 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
     const upperCurrency = currency.toUpperCase();
     const allowedCurrencies = ['UGX', 'KES', 'TZS', 'RWF', 'ZAR'];
     if (!allowedCurrencies.includes(upperCurrency)) {
-        return res.status(400).json({ error: `Unsupported currency.` });
+        return res.status(400).json({ error: `Unsupported currency: ${upperCurrency}` });
     }
 
     if (!PRICING_MATRIX[campaignType]) {
         return res.status(400).json({ error: "Invalid campaign format type." });
     }
 
-    let validatedUnits = parseInt(totalUnits) || 1;
+    // Explicitly cast parameters to matching types to fix structural database anomalies
+    const parsedAdvertiserId = parseInt(advertiserId, 10);
+    let validatedUnits = parseInt(totalUnits, 10) || 1;
+    
     if (campaignType === 'classified' || campaignType === 'social_repost') {
         validatedUnits = 1; 
     }
 
-    if (validatedUnits <= 0) {
-        return res.status(400).json({ error: "Units must be greater than zero." });
+    if (isNaN(parsedAdvertiserId) || validatedUnits <= 0) {
+        return res.status(400).json({ error: "Invalid Advertiser ID or units value." });
     }
 
     const unitRate = PRICING_MATRIX[campaignType][upperCurrency];
-    const totalCampaignCost = unitRate * validatedUnits;
+    const totalCampaignCost = parseFloat((unitRate * validatedUnits).toFixed(2));
 
     const client = await pool.connect();
 
     try {
+        // Dynamic structural auto-repair for the campaigns relation properties
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS campaigns (
+                id SERIAL PRIMARY KEY,
+                advertiser_id INTEGER NOT NULL,
+                campaign_type VARCHAR(50) NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                media_url TEXT NOT NULL,
+                target_country VARCHAR(100) NOT NULL,
+                currency VARCHAR(10) NOT NULL,
+                total_units INTEGER NOT NULL,
+                total_budget DECIMAL(15, 2) NOT NULL,
+                remaining_budget DECIMAL(15, 2) NOT NULL,
+                status VARCHAR(50) DEFAULT 'pending_admin_approval',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
         await client.query('BEGIN');
 
-        // Row-level locks to prevent double spend
+        // Row-level isolation lock to prevent concurrent multi-spending anomalies
         const walletColumn = `${upperCurrency.toLowerCase()}_balance`;
         const walletQuery = `
             SELECT ${walletColumn} AS balance 
@@ -216,11 +235,11 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
             FOR UPDATE
         `;
         
-        const walletResult = await client.query(walletQuery, [advertiserId]);
+        const walletResult = await client.query(walletQuery, [parsedAdvertiserId]);
 
         if (walletResult.rows.length === 0) {
             await client.query('ROLLBACK');
-            return res.status(404).json({ error: "Wallet database profile not found." });
+            return res.status(404).json({ error: "Wallet database profile not found for this advertiser ID." });
         }
 
         const currentBalance = parseFloat(walletResult.rows[0].balance);
@@ -235,15 +254,15 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
             });
         }
 
-        // Deduct funds from database
+        // Deduct transactional funds cleanly
         const deductQuery = `
             UPDATE wallets 
             SET ${walletColumn} = ${walletColumn} - $1, updated_at = NOW() 
             WHERE advertiser_id = $2
         `;
-        await client.query(deductQuery, [totalCampaignCost, advertiserId]);
+        await client.query(deductQuery, [totalCampaignCost, parsedAdvertiserId]);
 
-        // Create campaign record
+        // Create campaign record matching explicit schema requirements
         const insertCampaignQuery = `
             INSERT INTO campaigns (
                 advertiser_id, campaign_type, title, media_url, 
@@ -253,7 +272,7 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
         `;
         
         const campaignResult = await client.query(insertCampaignQuery, [
-            advertiserId, 
+            parsedAdvertiserId, 
             campaignType, 
             title, 
             mediaUrl, 
@@ -274,12 +293,16 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
 
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error("Transaction Aborted:", error);
-        res.status(500).json({ error: "Internal payment processing error occurred." });
+        console.error("Database Transaction Aborted Safely:", error.message);
+        res.status(500).json({ 
+            error: "Internal payment processing error occurred.",
+            details: error.message 
+        });
     } finally {
         client.release();
     }
 });
+
 // ==========================================
 // 3. MOBILE MONEY & WEBHOOK CONTROLLERS
 // ==========================================
@@ -287,7 +310,6 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
 // Route A: Simulate initiating a Mobile Money Payment
 app.post('/api/payments/deposit', authenticateUser, async (req, res) => {
     const { amount, currency, phoneNumber, network } = req.body;
-    const advertiserId = req.user.id;
 
     if (!amount || !currency || !phoneNumber || !network) {
         return res.status(400).json({ error: "Missing deposit payment parameters." });
@@ -300,13 +322,7 @@ app.post('/api/payments/deposit', authenticateUser, async (req, res) => {
     }
 
     try {
-        // Generate a mock external transaction reference ID
         const transactionId = 'TXN-' + Math.random().toString(36).substr(2, 9).toUpperCase();
-
-        // In production, you would call your Mobile Money API (e.g., Flutterwave) here.
-        // We will simulate a successful payment instantly by calling our own Webhook.
-        // This keeps your local testing flow seamless!
-        
         console.log(`Payment initiated: ${amount} ${upperCurrency} via ${network} (${phoneNumber})`);
 
         res.status(200).json({
@@ -314,17 +330,14 @@ app.post('/api/payments/deposit', authenticateUser, async (req, res) => {
             transactionId: transactionId,
             status: "pending"
         });
-
     } catch (err) {
         console.error(err.message);
         res.status(500).json({ error: "Error initiating payment." });
     }
 });
 
-// Route B: The Production-Grade Webhook Receiver
-// Securely credits the advertiser's wallet once the provider confirms the transfer
+// Route B: Webhook Receiver
 app.post('/api/payments/webhook', async (req, res) => {
-    // In production, verify provider signatures/IPs here to prevent fraud!
     const { advertiserId, amount, currency, status } = req.body;
 
     if (status !== 'successful') {
@@ -339,7 +352,6 @@ app.post('/api/payments/webhook', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // Check if wallet exists and lock row
         const checkWallet = await client.query(
             `SELECT * FROM wallets WHERE advertiser_id = $1 FOR UPDATE`, 
             [advertiserId]
@@ -350,7 +362,6 @@ app.post('/api/payments/webhook', async (req, res) => {
             return res.status(404).json({ error: "Target wallet not found." });
         }
 
-        // Add funds to the correct currency wallet
         const creditQuery = `
             UPDATE wallets 
             SET ${walletColumn} = ${walletColumn} + $1, updated_at = NOW() 
@@ -360,7 +371,6 @@ app.post('/api/payments/webhook', async (req, res) => {
         const updatedWallet = await client.query(creditQuery, [amount, advertiserId]);
 
         await client.query('COMMIT');
-        
         console.log(`SUCCESSFUL WEBHOOK: Credited ${amount} ${upperCurrency} to user ID ${advertiserId}`);
         res.status(200).json({ 
             message: "Wallet successfully credited.", 
@@ -376,7 +386,7 @@ app.post('/api/payments/webhook', async (req, res) => {
     }
 });
 
-// Start Server
+// Start Server cleanly
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`AfriAd Dynamic Server running on port ${PORT}`);
 });
