@@ -1,55 +1,171 @@
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+
+// Set production/development dynamic port
+const PORT = process.env.PORT || 5000;
+
+// Enable CORS cleanly for cross-platform request handling
+app.use(cors({
+    origin: '*', 
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
 
+// Database connection pool setup
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
-// ==========================================
-// 1. SYSTEM PRICING MATRIX
-// ==========================================
-const PRICING_MATRIX = {
-    classified: {
-        UGX: 7500,
-        KES: 260,
-        TZS: 5200,
-        RWF: 2600,
-        ZAR: 37
-    },
-    banner_cpc: {
-        UGX: 112,
-        KES: 3.9,
-        TZS: 78,
-        RWF: 39,
-        ZAR: 0.55
-    },
-    video_ad: {
-        UGX: 150,
-        KES: 5.2,
-        TZS: 104,
-        RWF: 52,
-        ZAR: 0.74
-    },
-    social_repost: {
-        UGX: 37500,
-        KES: 1300,
-        TZS: 26000,
-        RWF: 13000,
-        ZAR: 185
+// Helper validation middleware
+const authenticateUser = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+        return res.status(401).json({ error: "Access denied. Token missing." });
+    }
+
+    try {
+        const verified = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret');
+        req.user = verified;
+        next();
+    } catch (err) {
+        res.status(403).json({ error: "Invalid token." });
     }
 };
 
+// Test Route
+app.get('/', (req, res) => {
+    res.send('AfriAd Multicurrency Backend API is running successfully!');
+});
+
 // ==========================================
-// 2. CAMPAIGN CREATION CONTROLLER
+// SYSTEM PRICING MATRIX
 // ==========================================
-app.post('/api/campaigns/create', async (req, res) => {
+const PRICING_MATRIX = {
+    classified: { UGX: 7500, KES: 260, TZS: 5200, RWF: 2600, ZAR: 37 },
+    banner_cpc: { UGX: 112, KES: 3.9, TZS: 78, RWF: 39, ZAR: 0.55 },
+    video_ad: { UGX: 150, KES: 5.2, TZS: 104, RWF: 52, ZAR: 0.74 },
+    social_repost: { UGX: 37500, KES: 1300, TZS: 26000, RWF: 13000, ZAR: 185 }
+};
+
+// ==========================================
+// 1. UPDATED AUTHENTICATION ROUTES
+// ==========================================
+
+// Register User (With automatic Multi-Currency Wallet Initializer)
+app.post('/api/auth/register', async (req, res) => {
+    const { username, email, password, role } = req.body;
+    const client = await pool.connect();
+
+    try {
+        if (!['advertiser', 'earner'].includes(role)) {
+            return res.status(400).json({ error: "Role must be 'advertiser' or 'earner'" });
+        }
+
+        const salt = await bcrypt.genSalt(10);
+        const passwordHash = await bcrypt.hash(password, salt);
+
+        // Start registration transaction to ensure wallet is ALWAYS created alongside user
+        await client.query('BEGIN');
+
+        const userResult = await client.query(
+            `INSERT INTO users (username, email, password_hash, role) 
+             VALUES ($1, $2, $3, $4) RETURNING id, username, email, role, created_at`,
+            [username, email, passwordHash, role]
+        );
+
+        const newUser = userResult.rows[0];
+
+        // Create the user's multi-currency wallet profile initialized at 0.00 balances
+        await client.query(
+            `INSERT INTO wallets (advertiser_id, ugx_balance, kes_balance, tzs_balance, rwf_balance, zar_balance) 
+             VALUES ($1, 0.00, 0.00, 0.00, 0.00, 0.00)`,
+            [newUser.id]
+        );
+
+        await client.query('COMMIT');
+
+        res.status(201).json({ 
+            message: "User registered successfully with secure multi-currency wallet!", 
+            user: newUser 
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        if (err.code === '23505') {
+            return res.status(400).json({ error: "Username or Email already exists." });
+        }
+        res.status(500).send("Server error during registration.");
+    } finally {
+        client.release();
+    }
+});
+
+// Login User (Resolves balance objects from the wallets table)
+app.post('/api/auth/login', async (req, res) => {
+    const { email, password } = req.body;
+
+    try {
+        // Find user first
+        const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+        if (userResult.rows.length === 0) {
+            return res.status(400).json({ error: "Invalid credentials." });
+        }
+
+        const user = userResult.rows[0];
+        const isMatch = await bcrypt.compare(password, user.password_hash);
+        if (!isMatch) {
+            return res.status(400).json({ error: "Invalid credentials." });
+        }
+
+        // Retrieve wallet state linked to user
+        const walletResult = await pool.query('SELECT * FROM wallets WHERE advertiser_id = $1', [user.id]);
+        let userWallet = { ugx_balance: 0, kes_balance: 0, tzs_balance: 0, rwf_balance: 0, zar_balance: 0 };
+
+        if (walletResult.rows.length > 0) {
+            userWallet = walletResult.rows[0];
+        }
+
+        const token = jwt.sign(
+            { id: user.id, role: user.role },
+            process.env.JWT_SECRET || 'fallback_secret',
+            { expiresIn: '24h' }
+        );
+
+        res.json({
+            token,
+            user: {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                role: user.role,
+                ugx_balance: userWallet.ugx_balance,
+                kes_balance: userWallet.kes_balance,
+                tzs_balance: userWallet.tzs_balance,
+                rwf_balance: userWallet.rwf_balance,
+                zar_balance: userWallet.zar_balance
+            }
+        });
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send("Server error during login.");
+    }
+});
+
+// ==========================================
+// 2. CONCURRENCY CONTROL CAMPAIGN ROUTE
+// ==========================================
+app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
     const { 
         advertiserId, 
         campaignType, 
@@ -60,43 +176,38 @@ app.post('/api/campaigns/create', async (req, res) => {
         totalUnits 
     } = req.body;
 
-    // A. Validation Layer
     if (!advertiserId || !campaignType || !title || !mediaUrl || !targetCountry || !currency) {
-        return res.status(400).json({ error: "Missing required campaign registration parameters." });
+        return res.status(400).json({ error: "Missing required campaign parameters." });
     }
 
     const upperCurrency = currency.toUpperCase();
     const allowedCurrencies = ['UGX', 'KES', 'TZS', 'RWF', 'ZAR'];
     if (!allowedCurrencies.includes(upperCurrency)) {
-        return res.status(400).json({ error: `Unsupported currency. Choose from: ${allowedCurrencies.join(', ')}` });
+        return res.status(400).json({ error: `Unsupported currency.` });
     }
 
     if (!PRICING_MATRIX[campaignType]) {
-        return res.status(400).json({ error: "Invalid campaign format type provided." });
+        return res.status(400).json({ error: "Invalid campaign format type." });
     }
 
-    // Assign unit structures based on campaign types
     let validatedUnits = parseInt(totalUnits) || 1;
     if (campaignType === 'classified' || campaignType === 'social_repost') {
-        validatedUnits = 1; // Forced flat rates
+        validatedUnits = 1; 
     }
 
     if (validatedUnits <= 0) {
         return res.status(400).json({ error: "Units must be greater than zero." });
     }
 
-    // B. Calculate Cost
     const unitRate = PRICING_MATRIX[campaignType][upperCurrency];
     const totalCampaignCost = unitRate * validatedUnits;
 
-    // Get a client from the pool to run a controlled transaction block
     const client = await pool.connect();
 
     try {
-        // C. Start PostgreSQL Isolation Transaction
         await client.query('BEGIN');
 
-        // D. Row-level Lock on Wallet to block concurrent race conditions
+        // Row-level locks to prevent double spend
         const walletColumn = `${upperCurrency.toLowerCase()}_balance`;
         const walletQuery = `
             SELECT ${walletColumn} AS balance 
@@ -109,7 +220,7 @@ app.post('/api/campaigns/create', async (req, res) => {
 
         if (walletResult.rows.length === 0) {
             await client.query('ROLLBACK');
-            return res.status(404).json({ error: "Wallet not found for this advertiser ID." });
+            return res.status(404).json({ error: "Wallet database profile not found." });
         }
 
         const currentBalance = parseFloat(walletResult.rows[0].balance);
@@ -117,14 +228,14 @@ app.post('/api/campaigns/create', async (req, res) => {
         if (currentBalance < totalCampaignCost) {
             await client.query('ROLLBACK');
             return res.status(400).json({ 
-                error: "Insufficient funds.", 
+                error: "Insufficient funds to launch this campaign.", 
                 required: totalCampaignCost, 
                 available: currentBalance, 
                 currency: upperCurrency 
             });
         }
 
-        // E. Safely Deduct Funds
+        // Deduct funds from database
         const deductQuery = `
             UPDATE wallets 
             SET ${walletColumn} = ${walletColumn} - $1, updated_at = NOW() 
@@ -132,7 +243,7 @@ app.post('/api/campaigns/create', async (req, res) => {
         `;
         await client.query(deductQuery, [totalCampaignCost, advertiserId]);
 
-        // F. Insert New Campaign
+        // Create campaign record
         const insertCampaignQuery = `
             INSERT INTO campaigns (
                 advertiser_id, campaign_type, title, media_url, 
@@ -153,7 +264,6 @@ app.post('/api/campaigns/create', async (req, res) => {
             totalCampaignCost
         ]);
 
-        // G. Commit Transaction
         await client.query('COMMIT');
 
         res.status(201).json({
@@ -163,17 +273,15 @@ app.post('/api/campaigns/create', async (req, res) => {
         });
 
     } catch (error) {
-        // Safe Rollback in case of code or network level failures
         await client.query('ROLLBACK');
-        console.error("Transaction Aborted Safely:", error);
-        res.status(500).json({ error: "An internal payment transaction error occurred." });
+        console.error("Transaction Aborted:", error);
+        res.status(500).json({ error: "Internal payment processing error occurred." });
     } finally {
-        // Release client back to pool
         client.release();
     }
 });
 
-const PORT = process.env.PORT || 5000;
+// Start Server
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Financial API processing server active on port ${PORT}`);
+    console.log(`AfriAd Dynamic Server running on port ${PORT}`);
 });
