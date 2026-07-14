@@ -1,445 +1,192 @@
 const express = require('express');
-const { Pool } = require('pg');
 const cors = require('cors');
-const bcrypt = require('bcryptjs');
+const multer = require('multer');
 const jwt = require('jsonwebtoken');
-require('dotenv').config();
+const { Pool } = require('pg'); // Or your respective database driver (e.g., mongoose if MongoDB)
 
 const app = express();
-const PORT = process.env.PORT || 5000;
 
-// Dynamic Production CORS configuration
+// 1. DYNAMIC PORT FOR RENDER
+// Render injects its own port. Using process.env.PORT ensures it binds correctly.
+const PORT = process.env.PORT || 10000;
+
+// 2. PRODUCTION CORS SETTINGS
+// Ensures your Vercel frontend is allowed to talk to your Render backend safely.
 app.use(cors({
-    origin: '*', 
+    origin: [
+        /vercel\.app$/, // Allows all Vercel preview deployments dynamically
+        "http://localhost:3000", // Safe fallback for local development
+        "http://localhost:5173"
+    ],
+    credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 app.use(express.json());
 
-// Database connection pool setup
+// 3. FILE UPLOAD CONFIG (MULTER)
+// This safely stores uploaded media files in Render's temp directory before serving/processing
+const upload = multer({ dest: '/tmp/uploads' }); 
+
+// 4. RAILWAY DATABASE CONNECTION (POSTGRESQL EXAMPLE)
+// Uses the standard connection string provided in your Railway dashboard environment variables
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
-    max: 20,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 2000
+    ssl: {
+        rejectUnauthorized: false // Required for SSL connections to Railway databases
+    }
 });
 
-// ==========================================
-// SYSTEM PRICING MATRIX
-// ==========================================
-const PRICING_MATRIX = {
-    classified: { UGX: 7500, KES: 260, TZS: 5200, RWF: 2600, ZAR: 37 },
-    banner_cpc: { UGX: 112, KES: 3.9, TZS: 78, RWF: 39, ZAR: 0.55 },
-    video_ad: { UGX: 150, KES: 5.2, TZS: 104, RWF: 52, ZAR: 0.74 },
-    social_repost: { UGX: 37500, KES: 1300, TZS: 26000, RWF: 13000, ZAR: 185 }
-};
+const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret_for_local_dev';
 
 // ==========================================
-// 1. ISOLATED DATABASE INITIALIZATION (ALL HOT FIXES APPLIED)
+// API ROUTE 1: REGISTER
 // ==========================================
-const initializeDatabaseSchema = async () => {
-    const client = await pool.connect();
-    try {
-        console.log("Initializing production database schema sync...");
-        
-        // Ensure Users Table exists
-        await client.query(`
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username VARCHAR(100) NOT NULL UNIQUE,
-                email VARCHAR(255) NOT NULL UNIQUE,
-                password_hash VARCHAR(255) NOT NULL,
-                role VARCHAR(50) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-
-        // Ensure Wallets Table exists
-        await client.query(`
-            CREATE TABLE IF NOT EXISTS wallets (
-                id SERIAL PRIMARY KEY,
-                advertiser_id INTEGER NOT NULL UNIQUE,
-                ugx_balance DECIMAL(15, 2) DEFAULT 0.00,
-                kes_balance DECIMAL(15, 2) DEFAULT 0.00,
-                tzs_balance DECIMAL(15, 2) DEFAULT 0.00,
-                rwf_balance DECIMAL(15, 2) DEFAULT 0.00,
-                zar_balance DECIMAL(15, 2) DEFAULT 0.00,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-
-        // Ensure Campaigns Table exists
-        await client.query(`
-            CREATE TABLE IF NOT EXISTS campaigns (
-                id SERIAL PRIMARY KEY,
-                advertiser_id INTEGER NOT NULL,
-                campaign_type VARCHAR(50) NOT NULL,
-                title VARCHAR(255) NOT NULL,
-                media_url TEXT NOT NULL,
-                target_country VARCHAR(100) NOT NULL,
-                currency VARCHAR(10) NOT NULL,
-                total_units INTEGER NOT NULL,
-                total_budget DECIMAL(15, 2) NOT NULL,
-                remaining_budget DECIMAL(15, 2) NOT NULL,
-                status VARCHAR(50) DEFAULT 'pending_admin_approval',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-
-        // HOT PATCHES: Explicitly inject every schema element if the table was pre-existing but modified
-        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS advertiser_id INTEGER;`);
-        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS campaign_type VARCHAR(50) DEFAULT 'classified';`);
-        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS title VARCHAR(255) DEFAULT '';`);
-        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS media_url TEXT DEFAULT '';`);
-        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS target_country VARCHAR(100) DEFAULT '';`);
-        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS currency VARCHAR(10) DEFAULT 'UGX';`);
-        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS total_units INTEGER DEFAULT 1;`);
-        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS total_budget DECIMAL(15, 2) DEFAULT 0.00;`);
-        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS remaining_budget DECIMAL(15, 2) DEFAULT 0.00;`);
-        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'pending_admin_approval';`);
-
-        console.log("Database schema synchronized and auto-healed successfully!");
-    } catch (err) {
-        console.error("Critical error during database layout initialization:", err.message);
-    } finally {
-        client.release();
-    }
-};
-
-// Start DB schema initialization
-initializeDatabaseSchema();
-
-// Helper JWT Authentication Middleware
-const authenticateUser = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-
-    if (!token) {
-        return res.status(401).json({ error: "Access denied. Token missing." });
-    }
-
-    try {
-        const verified = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret');
-        req.user = verified;
-        next();
-    } catch (err) {
-        res.status(403).json({ error: "Invalid token." });
-    }
-};
-
-// Standard API Health Check
-app.get('/', (req, res) => {
-    res.json({
-        message: "AfriAd Multicurrency Backend API is running successfully!",
-        branding: {
-            logo_style: "joined-double-a",
-            primary_color: "#FF5A00",
-            secondary_color: "#00B25C"
-        }
-    });
-});
-
-// ==========================================
-// 2. AUTHENTICATION CONTROLLERS
-// ==========================================
-
-// Register User
 app.post('/api/auth/register', async (req, res) => {
-    const { username, email, password, role } = req.body;
-    const client = await pool.connect();
+    const { username, email, password } = req.body;
+    if (!username || !email || !password) {
+        return res.status(400).json({ error: 'All fields are required.' });
+    }
 
     try {
-        if (!['advertiser', 'earner'].includes(role)) {
-            return res.status(400).json({ error: "Role must be 'advertiser' or 'earner'" });
-        }
-
-        const salt = await bcrypt.genSalt(10);
-        const passwordHash = await bcrypt.hash(password, salt);
-
-        await client.query('BEGIN');
-
-        const userResult = await client.query(
-            `INSERT INTO users (username, email, password_hash, role) 
-             VALUES ($1, $2, $3, $4) RETURNING id, username, email, role, created_at`,
-            [username, email, passwordHash, role]
-        );
-
-        const newUser = userResult.rows[0];
-
-        await client.query(
-            `INSERT INTO wallets (advertiser_id, ugx_balance, kes_balance, tzs_balance, rwf_balance, zar_balance) 
-             VALUES ($1, 0.00, 0.00, 0.00, 0.00, 0.00)`,
-            [newUser.id]
-        );
-
-        await client.query('COMMIT');
-
-        res.status(201).json({ 
-            message: "User registered successfully with secure multi-currency wallet!", 
-            user: newUser 
-        });
+        // Query matching your Railway schema
+        // Note: keeping default starting balances to 0.00 to prevent NaN errors on the dashboard
+        const queryText = `
+            INSERT INTO users (username, email, password, ugx_balance, kes_balance, tzs_balance, rwf_balance, zar_balance) 
+            VALUES ($1, $2, $3, 0.00, 0.00, 0.00, 0.00, 0.00) 
+            RETURNING id, username, email;
+        `;
+        const values = [username, email, password];
+        const result = await pool.query(queryText, values);
+        
+        res.status(201).json({ message: 'Registration successful', user: result.rows[0] });
     } catch (err) {
-        await client.query('ROLLBACK');
-        console.error("Registration error:", err.message);
-        if (err.code === '23505') {
-            return res.status(400).json({ error: "Username or Email already exists." });
-        }
-        res.status(500).send("Server error during registration.");
-    } finally {
-        client.release();
+        console.error(err);
+        res.status(500).json({ error: 'Database error occurred during registration.' });
     }
 });
 
-// Login User
+// ==========================================
+// API ROUTE 2: LOGIN
+// ==========================================
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
-
+    
     try {
-        const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-        if (userResult.rows.length === 0) {
-            return res.status(400).json({ error: "Invalid credentials." });
+        const queryText = `SELECT * FROM users WHERE email = $1 AND password = $2 LIMIT 1;`;
+        const result = await pool.query(queryText, [email, password]);
+        
+        if (result.rows.length === 0) {
+            return res.status(401).json({ error: 'Invalid email or password.' });
         }
 
-        const user = userResult.rows[0];
-        const isMatch = await bcrypt.compare(password, user.password_hash);
-        if (!isMatch) {
-            return res.status(400).json({ error: "Invalid credentials." });
-        }
-
-        const walletResult = await pool.query('SELECT * FROM wallets WHERE advertiser_id = $1', [user.id]);
-        let userWallet = { ugx_balance: 0, kes_balance: 0, tzs_balance: 0, rwf_balance: 0, zar_balance: 0 };
-
-        if (walletResult.rows.length > 0) {
-            userWallet = walletResult.rows[0];
-        }
-
-        const token = jwt.sign(
-            { id: user.id, role: user.role },
-            process.env.JWT_SECRET || 'fallback_secret',
-            { expiresIn: '24h' }
-        );
-
+        const user = result.rows[0];
+        const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '24h' });
+        
+        // Return exactly what the premium dashboard expects (lower_case balance keys)
         res.json({
             token,
             user: {
                 id: user.id,
                 username: user.username,
                 email: user.email,
-                role: user.role,
-                ugx_balance: userWallet.ugx_balance,
-                kes_balance: userWallet.kes_balance,
-                tzs_balance: userWallet.tzs_balance,
-                rwf_balance: userWallet.rwf_balance,
-                zar_balance: userWallet.zar_balance
+                ugx_balance: user.ugx_balance,
+                kes_balance: user.kes_balance,
+                tzs_balance: user.tzs_balance,
+                rwf_balance: user.rwf_balance,
+                zar_balance: user.zar_balance
             }
         });
     } catch (err) {
-        console.error("Login Error:", err.message);
-        res.status(500).send("Server error during login.");
+        console.error(err);
+        res.status(500).json({ error: 'Internal Database Login Error' });
     }
 });
 
 // ==========================================
-// 3. CAMPAIGN CREATION WITH ATOMIC ISOLATION
+// API ROUTE 3: LAUNCH CAMPAIGN (WITH FILE UPLOAD)
 // ==========================================
-app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
-    const { 
-        advertiserId, 
-        campaignType, 
-        title, 
-        mediaUrl, 
-        targetCountry, 
-        currency, 
-        totalUnits 
-    } = req.body;
-
-    if (!advertiserId || !campaignType || !title || !mediaUrl || !targetCountry || !currency) {
-        return res.status(400).json({ error: "Missing required campaign parameters." });
-    }
-
-    const upperCurrency = currency.toUpperCase();
-    const allowedCurrencies = ['UGX', 'KES', 'TZS', 'RWF', 'ZAR'];
-    if (!allowedCurrencies.includes(upperCurrency)) {
-        return res.status(400).json({ error: `Unsupported currency: ${upperCurrency}` });
-    }
-
-    if (!PRICING_MATRIX[campaignType]) {
-        return res.status(400).json({ error: "Invalid campaign format type." });
-    }
-
-    const normalizedAdvertiserId = Number(advertiserId);
-    let validatedUnits = parseInt(totalUnits, 10) || 1;
+app.post('/api/campaigns/create', upload.single('mediaFile'), async (req, res) => {
+    const { advertiserId, campaignType, title, targetCountry, currency, totalUnits } = req.body;
     
-    if (campaignType === 'classified' || campaignType === 'social_repost') {
-        validatedUnits = 1; 
-    }
-
-    if (isNaN(normalizedAdvertiserId) || validatedUnits <= 0) {
-        return res.status(400).json({ error: "Invalid advertiser reference or units." });
-    }
-
-    const unitRate = PRICING_MATRIX[campaignType][upperCurrency];
-    const totalCampaignCost = parseFloat((unitRate * validatedUnits).toFixed(2));
-
-    const client = await pool.connect();
+    // Check if a file was uploaded (optional fallback)
+    const file = req.file; 
+    const mediaUrl = file ? `/uploads/${file.filename}` : null;
 
     try {
-        await client.query('BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED');
-
-        const walletColumn = `${upperCurrency.toLowerCase()}_balance`;
+        // 1. Fetch advertiser details
+        const userQuery = await pool.query('SELECT * FROM users WHERE id = $1 LIMIT 1;', [advertiserId]);
+        if (userQuery.rows.length === 0) {
+            return res.status(404).json({ error: 'Advertiser not found.' });
+        }
         
-        const walletResult = await client.query(
-            `SELECT ${walletColumn} AS balance FROM wallets WHERE advertiser_id = $1 FOR UPDATE`, 
-            [normalizedAdvertiserId]
-        );
+        const user = userQuery.rows[0];
+        const currencyKey = `${currency.toLowerCase()}_balance`;
+        const currentBalance = Number(user[currencyKey]);
+        
+        // Calculate basic baseline campaign cost (units * baseline modifier)
+        const campaignCost = Number(totalUnits) * 10; 
 
-        if (walletResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: "Wallet database profile not found." });
+        if (currentBalance < campaignCost) {
+            return res.status(400).json({ error: `Insufficient funds in your ${currency} wallet.` });
         }
 
-        const currentBalance = parseFloat(walletResult.rows[0].balance);
+        const updatedBalance = currentBalance - campaignCost;
 
-        if (currentBalance < totalCampaignCost) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ 
-                error: "Insufficient funds to launch this campaign.", 
-                required: totalCampaignCost, 
-                available: currentBalance, 
-                currency: upperCurrency 
-            });
-        }
+        // Start transactional updates
+        await pool.query('BEGIN');
 
-        // Deduct funds cleanly
-        await client.query(
-            `UPDATE wallets SET ${walletColumn} = ${walletColumn} - $1, updated_at = NOW() WHERE advertiser_id = $2`,
-            [totalCampaignCost, normalizedAdvertiserId]
+        // 2. Deduct funds from user's Railway record
+        await pool.query(
+            `UPDATE users SET ${currencyKey} = $1 WHERE id = $2;`,
+            [updatedBalance, advertiserId]
         );
 
-        const insertCampaignQuery = `
-            INSERT INTO campaigns (
-                advertiser_id, campaign_type, title, media_url, 
-                target_country, currency, total_units, total_budget, remaining_budget, status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending_admin_approval')
-            RETURNING *
+        // 3. Save Campaign to database
+        const campaignQuery = `
+            INSERT INTO campaigns (advertiser_id, campaign_type, title, target_country, currency, total_units, media_url, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING')
+            RETURNING id, title, total_units, currency;
         `;
-        
-        const campaignResult = await client.query(insertCampaignQuery, [
-            normalizedAdvertiserId, 
-            campaignType, 
-            title, 
-            mediaUrl, 
-            targetCountry, 
-            upperCurrency, 
-            validatedUnits, 
-            totalCampaignCost, 
-            totalCampaignCost
-        ]);
+        const campaignValues = [advertiserId, campaignType, title, targetCountry, currency, totalUnits, mediaUrl];
+        const campaignResult = await pool.query(campaignQuery, campaignValues);
 
-        await client.query('COMMIT');
+        await pool.commit();
 
+        // 4. Return correct keys to frontend
         res.status(201).json({
-            message: "Campaign initialized successfully and is pending admin validation.",
             campaign: campaignResult.rows[0],
-            newBalance: currentBalance - totalCampaignCost
+            newBalance: updatedBalance
         });
 
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("DATABASE TRANSACTION REJECTED:", error.message);
-        res.status(500).json({ 
-            error: "Internal payment processing error occurred.",
-            details: error.message 
-        });
-    } finally {
-        client.release();
+    } catch (err) {
+        await pool.query('ROLLBACK');
+        console.error(err);
+        res.status(500).json({ error: 'Failed to process transaction on database.' });
     }
 });
 
 // ==========================================
-// 4. MOBILE MONEY & WEBHOOKS
+// API ROUTE 4: DEPOSITS
 // ==========================================
-
-// Simulate Mobile Money deposit request
-app.post('/api/payments/deposit', authenticateUser, async (req, res) => {
-    const { amount, currency, phoneNumber, network } = req.body;
-
-    if (!amount || !currency || !phoneNumber || !network) {
-        return res.status(400).json({ error: "Missing deposit payment parameters." });
-    }
-
-    const upperCurrency = currency.toUpperCase();
-    const allowedCurrencies = ['UGX', 'KES', 'TZS', 'RWF', 'ZAR'];
-    if (!allowedCurrencies.includes(upperCurrency)) {
-        return res.status(400).json({ error: "Unsupported currency." });
-    }
+app.post('/api/payments/deposit', async (req, res) => {
+    const { amount, currency, phoneNumber } = req.body;
 
     try {
-        const transactionId = 'TXN-' + Math.random().toString(36).substr(2, 9).toUpperCase();
-        console.log(`Payment initiated: ${amount} ${upperCurrency} via ${network} (${phoneNumber})`);
+        // Process standard Mobile Money payment hook logic here...
+        // e.g., triggering MTN/Airtel API
+        const transactionId = "TXN_" + Math.random().toString(36).substr(2, 9).toUpperCase();
 
-        res.status(200).json({
-            message: "Mobile Money prompt sent to your phone. Please approve the transaction.",
-            transactionId: transactionId,
-            status: "pending"
+        res.json({
+            message: `Mobile money payment request pushed successfully to ${phoneNumber}`,
+            transactionId: transactionId
         });
     } catch (err) {
-        console.error("Deposit Initiation Error:", err.message);
-        res.status(500).json({ error: "Error initiating payment." });
+        res.status(500).json({ error: 'Payment request failed.' });
     }
 });
 
-// Webhook Receiver
-app.post('/api/payments/webhook', async (req, res) => {
-    const { advertiserId, amount, currency, status } = req.body;
-
-    if (status !== 'successful') {
-        return res.status(200).json({ message: "Transaction ignored (unsuccessful status)." });
-    }
-
-    const upperCurrency = currency.toUpperCase();
-    const walletColumn = `${upperCurrency.toLowerCase()}_balance`;
-    const normalizedAdvertiserId = Number(advertiserId);
-
-    const client = await pool.connect();
-
-    try {
-        await client.query('BEGIN');
-
-        const checkWallet = await client.query(
-            `SELECT * FROM wallets WHERE advertiser_id = $1 FOR UPDATE`, 
-            [normalizedAdvertiserId]
-        );
-
-        if (checkWallet.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: "Target wallet not found." });
-        }
-
-        const updatedWallet = await client.query(
-            `UPDATE wallets SET ${walletColumn} = ${walletColumn} + $1, updated_at = NOW() WHERE advertiser_id = $2 RETURNING *`,
-            [amount, normalizedAdvertiserId]
-        );
-
-        await client.query('COMMIT');
-        console.log(`SUCCESSFUL WEBHOOK: Credited ${amount} ${upperCurrency} to user ID ${normalizedAdvertiserId}`);
-        res.status(200).json({ 
-            message: "Wallet successfully credited.", 
-            wallet: updatedWallet.rows[0] 
-        });
-
-    } catch (err) {
-        await client.query('ROLLBACK');
-        console.error("Webhook transaction failed safely:", err.message);
-        res.status(500).json({ error: "Internal webhook processing error." });
-    } finally {
-        client.release();
-    }
-});
-
-// Start listening safely
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`AfriAd Production Server listening on port ${PORT}`);
+app.listen(PORT, () => {
+    console.log(`Server listening dynamically on Port ${PORT}`);
 });
