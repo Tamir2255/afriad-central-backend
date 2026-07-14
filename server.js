@@ -17,11 +17,11 @@ app.use(cors({
 
 app.use(express.json());
 
-// Database connection pool setup with aggressive keep-alives and idle timeouts
+// Database connection pool setup
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false },
-    max: 20, // Limit active clients to prevent connection starvation on Render
+    max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 2000
 });
@@ -37,7 +37,7 @@ const PRICING_MATRIX = {
 };
 
 // ==========================================
-// 1. ISOLATED DATABASE INITIALIZATION
+// 1. ISOLATED DATABASE INITIALIZATION (HOT FIXES APPLIED)
 // ==========================================
 const initializeDatabaseSchema = async () => {
     const client = await pool.connect();
@@ -88,11 +88,12 @@ const initializeDatabaseSchema = async () => {
             );
         `);
 
-        // Apply hot patches to older table variations
+        // HOT FIX: Force add columns if table exists but is missing fields (resolves the exact pg error)
+        await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS campaign_type VARCHAR(50) DEFAULT 'classified';`);
         await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS total_units INTEGER DEFAULT 1;`);
         await client.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS remaining_budget DECIMAL(15, 2) DEFAULT 0.00;`);
 
-        console.log("Database schema synchronized and hot patches applied.");
+        console.log("Database schema synchronized successfully!");
     } catch (err) {
         console.error("Critical error during database layout initialization:", err.message);
     } finally {
@@ -100,7 +101,7 @@ const initializeDatabaseSchema = async () => {
     }
 };
 
-// Start DB sync right before receiving web traffic
+// Start DB schema initialization
 initializeDatabaseSchema();
 
 // Helper JWT Authentication Middleware
@@ -121,9 +122,16 @@ const authenticateUser = (req, res, next) => {
     }
 };
 
-// Standard API Health Check
+// Standard API Health Check displaying our Brand Joined Logo configuration data
 app.get('/', (req, res) => {
-    res.send('AfriAd Multicurrency Backend API is running successfully!');
+    res.json({
+        message: "AfriAd Multicurrency Backend API is running successfully!",
+        branding: {
+            logo_style: "joined-double-a",
+            primary_color: "#FF5A00",
+            secondary_color: "#00B25C"
+        }
+    });
 });
 
 // ==========================================
@@ -254,7 +262,6 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
         return res.status(400).json({ error: "Invalid campaign format type." });
     }
 
-    // Type Normalization (Forces all inputs to clean JavaScript primitives)
     const normalizedAdvertiserId = Number(advertiserId);
     let validatedUnits = parseInt(totalUnits, 10) || 1;
     
@@ -272,12 +279,10 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
     const client = await pool.connect();
 
     try {
-        // Explicitly set Transaction Isolation Level to READ COMMITTED to prevent cross-locks
         await client.query('BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED');
 
         const walletColumn = `${upperCurrency.toLowerCase()}_balance`;
         
-        // Select matching row without using complex CAST calls which slow down Postgres indexing
         const walletResult = await client.query(
             `SELECT ${walletColumn} AS balance FROM wallets WHERE advertiser_id = $1 FOR UPDATE`, 
             [normalizedAdvertiserId]
@@ -300,7 +305,7 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
             });
         }
 
-        // Clean numeric execution path
+        // Deduct funds cleanly
         await client.query(
             `UPDATE wallets SET ${walletColumn} = ${walletColumn} - $1, updated_at = NOW() WHERE advertiser_id = $2`,
             [totalCampaignCost, normalizedAdvertiserId]
