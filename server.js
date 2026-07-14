@@ -1,4 +1,4 @@
-const BACKEND_URL = "https://afriad-central-backend.onrender.com"
+const BACKEND_URL = 'https://afriad-central-backend.onrender.com/api'
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
