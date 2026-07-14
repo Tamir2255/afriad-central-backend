@@ -9,7 +9,7 @@ require('dotenv').config();
 const app = express();
 
 // Render overrides this value dynamically to port 10000 or others
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 10000;
 
 // Enable CORS cleanly for production deployment environments
 app.use(cors({
