@@ -184,7 +184,8 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(400).json({ error: "Invalid credentials." });
         }
 
-        const walletResult = await pool.query('SELECT * FROM wallets WHERE advertiser_id = $1', [user.id]);
+        // Adaptive query supporting mixed type matching safely
+        const walletResult = await pool.query('SELECT * FROM wallets WHERE advertiser_id::text = $1::text', [user.id]);
         let userWallet = { ugx_balance: 0, kes_balance: 0, tzs_balance: 0, rwf_balance: 0, zar_balance: 0 };
 
         if (walletResult.rows.length > 0) {
@@ -245,16 +246,13 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
         return res.status(400).json({ error: "Invalid campaign format type." });
     }
 
-    // Explicitly cast parameters to matching types to fix structural database anomalies
-    const parsedAdvertiserId = parseInt(advertiserId, 10);
     let validatedUnits = parseInt(totalUnits, 10) || 1;
-    
     if (campaignType === 'classified' || campaignType === 'social_repost') {
         validatedUnits = 1; 
     }
 
-    if (isNaN(parsedAdvertiserId) || validatedUnits <= 0) {
-        return res.status(400).json({ error: "Invalid Advertiser ID or units value." });
+    if (validatedUnits <= 0) {
+        return res.status(400).json({ error: "Invalid units value." });
     }
 
     const unitRate = PRICING_MATRIX[campaignType][upperCurrency];
@@ -265,20 +263,20 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // Row-level isolation lock to prevent concurrent multi-spending anomalies
+        // Cast explicitly to text inside the lookups to prevent cross-variant column matching failures
         const walletColumn = `${upperCurrency.toLowerCase()}_balance`;
         const walletQuery = `
             SELECT ${walletColumn} AS balance 
             FROM wallets 
-            WHERE advertiser_id = $1 
+            WHERE advertiser_id::text = $1::text 
             FOR UPDATE
         `;
         
-        const walletResult = await client.query(walletQuery, [parsedAdvertiserId]);
+        const walletResult = await client.query(walletQuery, [advertiserId]);
 
         if (walletResult.rows.length === 0) {
             await client.query('ROLLBACK');
-            return res.status(404).json({ error: "Wallet database profile not found for this advertiser ID." });
+            return res.status(404).json({ error: "Wallet profile not found for your account setup." });
         }
 
         const currentBalance = parseFloat(walletResult.rows[0].balance);
@@ -293,25 +291,25 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
             });
         }
 
-        // Deduct transactional funds cleanly
+        // Deduct using precise cast logic
         const deductQuery = `
             UPDATE wallets 
             SET ${walletColumn} = ${walletColumn} - $1, updated_at = NOW() 
-            WHERE advertiser_id = $2
+            WHERE advertiser_id::text = $2::text
         `;
-        await client.query(deductQuery, [totalCampaignCost, parsedAdvertiserId]);
+        await client.query(deductQuery, [totalCampaignCost, advertiserId]);
 
-        // Create campaign record matching explicit schema requirements
+        // Insert campaign record safely using text parsing 
         const insertCampaignQuery = `
             INSERT INTO campaigns (
                 advertiser_id, campaign_type, title, media_url, 
                 target_country, currency, total_units, total_budget, remaining_budget, status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending_admin_approval')
+            ) VALUES ($1::integer, $2, $3, $4, $5, $6, $7, $8, $9, 'pending_admin_approval')
             RETURNING *
         `;
         
         const campaignResult = await client.query(insertCampaignQuery, [
-            parsedAdvertiserId, 
+            parseInt(advertiserId, 10), 
             campaignType, 
             title, 
             mediaUrl, 
@@ -392,7 +390,7 @@ app.post('/api/payments/webhook', async (req, res) => {
         await client.query('BEGIN');
 
         const checkWallet = await client.query(
-            `SELECT * FROM wallets WHERE advertiser_id = $1 FOR UPDATE`, 
+            `SELECT * FROM wallets WHERE advertiser_id::text = $1::text FOR UPDATE`, 
             [advertiserId]
         );
 
@@ -404,7 +402,7 @@ app.post('/api/payments/webhook', async (req, res) => {
         const creditQuery = `
             UPDATE wallets 
             SET ${walletColumn} = ${walletColumn} + $1, updated_at = NOW() 
-            WHERE advertiser_id = $2
+            WHERE advertiser_id::text = $2::text
             RETURNING *
         `;
         const updatedWallet = await client.query(creditQuery, [amount, advertiserId]);
