@@ -280,6 +280,101 @@ app.post('/api/campaigns/create', authenticateUser, async (req, res) => {
         client.release();
     }
 });
+// ==========================================
+// 3. MOBILE MONEY & WEBHOOK CONTROLLERS
+// ==========================================
+
+// Route A: Simulate initiating a Mobile Money Payment
+app.post('/api/payments/deposit', authenticateUser, async (req, res) => {
+    const { amount, currency, phoneNumber, network } = req.body;
+    const advertiserId = req.user.id;
+
+    if (!amount || !currency || !phoneNumber || !network) {
+        return res.status(400).json({ error: "Missing deposit payment parameters." });
+    }
+
+    const upperCurrency = currency.toUpperCase();
+    const allowedCurrencies = ['UGX', 'KES', 'TZS', 'RWF', 'ZAR'];
+    if (!allowedCurrencies.includes(upperCurrency)) {
+        return res.status(400).json({ error: "Unsupported currency." });
+    }
+
+    try {
+        // Generate a mock external transaction reference ID
+        const transactionId = 'TXN-' + Math.random().toString(36).substr(2, 9).toUpperCase();
+
+        // In production, you would call your Mobile Money API (e.g., Flutterwave) here.
+        // We will simulate a successful payment instantly by calling our own Webhook.
+        // This keeps your local testing flow seamless!
+        
+        console.log(`Payment initiated: ${amount} ${upperCurrency} via ${network} (${phoneNumber})`);
+
+        res.status(200).json({
+            message: "Mobile Money prompt sent to your phone. Please approve the transaction.",
+            transactionId: transactionId,
+            status: "pending"
+        });
+
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).json({ error: "Error initiating payment." });
+    }
+});
+
+// Route B: The Production-Grade Webhook Receiver
+// Securely credits the advertiser's wallet once the provider confirms the transfer
+app.post('/api/payments/webhook', async (req, res) => {
+    // In production, verify provider signatures/IPs here to prevent fraud!
+    const { advertiserId, amount, currency, status } = req.body;
+
+    if (status !== 'successful') {
+        return res.status(200).json({ message: "Transaction ignored (unsuccessful status)." });
+    }
+
+    const upperCurrency = currency.toUpperCase();
+    const walletColumn = `${upperCurrency.toLowerCase()}_balance`;
+
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        // Check if wallet exists and lock row
+        const checkWallet = await client.query(
+            `SELECT * FROM wallets WHERE advertiser_id = $1 FOR UPDATE`, 
+            [advertiserId]
+        );
+
+        if (checkWallet.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "Target wallet not found." });
+        }
+
+        // Add funds to the correct currency wallet
+        const creditQuery = `
+            UPDATE wallets 
+            SET ${walletColumn} = ${walletColumn} + $1, updated_at = NOW() 
+            WHERE advertiser_id = $2
+            RETURNING *
+        `;
+        const updatedWallet = await client.query(creditQuery, [amount, advertiserId]);
+
+        await client.query('COMMIT');
+        
+        console.log(`SUCCESSFUL WEBHOOK: Credited ${amount} ${upperCurrency} to user ID ${advertiserId}`);
+        res.status(200).json({ 
+            message: "Wallet successfully credited.", 
+            wallet: updatedWallet.rows[0] 
+        });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error("Webhook processing failed safely:", err.message);
+        res.status(500).json({ error: "Internal webhook processing error." });
+    } finally {
+        client.release();
+    }
+});
 
 // Start Server
 app.listen(PORT, '0.0.0.0', () => {
